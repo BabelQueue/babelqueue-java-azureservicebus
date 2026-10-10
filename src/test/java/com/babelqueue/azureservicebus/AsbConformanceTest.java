@@ -36,6 +36,9 @@ class AsbConformanceTest {
 
     private static final String URN = "urn:babel:orders:created";
 
+    /** Marker for a present-but-null application property (distinct from an absent one). */
+    private static final Object NULL_PROPERTY = new Object();
+
     private static String resource(String path) throws Exception {
         try (InputStream in = AsbConformanceTest.class.getResourceAsStream("/conformance/" + path)) {
             if (in == null) {
@@ -109,14 +112,24 @@ class AsbConformanceTest {
             boolean decode = "decode".equals(testCase.getString("expect"));
             // A JSON number stands for a native AMQP integer: exercise integral values at int32 and int64
             // width (a non-integral number is a double).
+            String valueType = testCase.optString("value_type", "");
+            assertTrue(valueType.isEmpty() || "float".equals(valueType),
+                "unknown value_type '" + valueType + "' (this reader only understands \"float\")");
             List<Object> variants = new ArrayList<>();
             if (testCase.has("value") && testCase.get("value") instanceof Number number) {
-                if (number.doubleValue() == Math.rint(number.doubleValue())) {
+                if ("float".equals(testCase.optString("value_type"))) {
+                    // An explicit floating-point case (e.g. 1.0): hand over real floats, never integers.
+                    variants.add(number.doubleValue());
+                    variants.add(number.floatValue());
+                } else if (number.doubleValue() == Math.rint(number.doubleValue())) {
                     variants.add(number.intValue());
                     variants.add(number.longValue());
                 } else {
                     variants.add(number.doubleValue());
                 }
+            } else if (testCase.has("value") && testCase.isNull("value")) {
+                // A present-but-null property: must behave exactly like an absent one (decode).
+                variants.add(NULL_PROPERTY);
             } else if (testCase.has("value")) {
                 variants.add(testCase.getString("value"));
             } else {
@@ -125,12 +138,14 @@ class AsbConformanceTest {
 
             for (Object variant : variants) {
                 String label = (testCase.has("value") ? "value=" + testCase.get("value") : "absent")
-                    + " (" + (variant == null ? "none" : variant.getClass().getSimpleName()) + ")";
+                    + " (" + (variant == null ? "none" : variant == NULL_PROPERTY ? "null" : variant.getClass().getSimpleName()) + ")";
                 ServiceBusReceivedMessage msg = mock(ServiceBusReceivedMessage.class);
                 when(msg.getBody()).thenReturn(BinaryData.fromString(fixture));
                 when(msg.getDeliveryCount()).thenReturn(1L);
                 Map<String, Object> props = new HashMap<>();
-                if (variant != null) {
+                if (variant == NULL_PROPERTY) {
+                    props.put(property, null);
+                } else if (variant != null) {
                     props.put(property, variant);
                 }
                 when(msg.getApplicationProperties()).thenReturn(props);
