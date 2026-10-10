@@ -15,7 +15,7 @@ propagation) as the .NET, Python, Go and Node SDKs. Implements
 <dependency>
   <groupId>com.babelqueue</groupId>
   <artifactId>babelqueue-azure-servicebus</artifactId>
-  <version>1.0.0</version>
+  <version>1.0.1</version>
 </dependency>
 ```
 
