@@ -2,10 +2,14 @@ package com.babelqueue.azureservicebus;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -14,13 +18,18 @@ import com.azure.core.util.BinaryData;
 import com.azure.core.util.IterableStream;
 import com.azure.messaging.servicebus.ServiceBusReceivedMessage;
 import com.azure.messaging.servicebus.ServiceBusReceiverClient;
+import com.azure.messaging.servicebus.models.DeadLetterOptions;
 import com.babelqueue.BabelQueueException;
 import com.babelqueue.EnvelopeCodec;
 import com.babelqueue.UnknownUrnException;
+import java.math.BigInteger;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 /**
  * Consumer behaviour against a mocked receiver (no broker): attempts = DeliveryCount - 1,
@@ -138,5 +147,114 @@ class AsbConsumerTest {
         ServiceBusReceiverClient receiver = receiverWith();
         AsbConsumer.builder(receiver).build().run(() -> false);
         verify(receiver, never()).receiveMessages(anyInt());
+    }
+
+    // ---- §4.7 schema-version gate -------------------------------------------------------------
+
+    private static ServiceBusReceivedMessage withVersion(String body, Object version, boolean present) {
+        ServiceBusReceivedMessage msg = received(1, body);
+        Map<String, Object> props = new HashMap<>();
+        if (present) {
+            props.put("bq-schema-version", version);
+        }
+        when(msg.getApplicationProperties()).thenReturn(props);
+        return msg;
+    }
+
+    @Test
+    void schemaVersionGateDecodesWhenMissingBlankOrSupported() {
+        Object[][] cases = {
+            {null, false}, {"", true}, {" \t", true}, {"\n\u000b\f\r", true}, {"1", true},
+            {1, true}, {1L, true}, {(short) 1, true}, {(byte) 1, true},
+        };
+        for (Object[] c : cases) {
+            ServiceBusReceiverClient receiver = receiverWith(withVersion(envelopeJson(), c[0], (Boolean) c[1]));
+            int[] handled = {0};
+            AsbConsumer.builder(receiver).handler(URN, (env, msg) -> handled[0]++).build().poll();
+
+            assertEquals(1, handled[0], "version=" + c[0]);
+            verify(receiver).complete(any(ServiceBusReceivedMessage.class));
+            verify(receiver, never()).deadLetter(any(ServiceBusReceivedMessage.class), any(DeadLetterOptions.class));
+            verify(receiver, never()).abandon(any(ServiceBusReceivedMessage.class));
+        }
+    }
+
+    @Test
+    void schemaVersionGateDeadLettersUnsupportedWithoutDecodingOrHandler() {
+        // BigInteger 2^64 + 1 must not truncate onto 1 (longValue() would).
+        Object[] versions = {"2", "x", 2, 2L, 0, 1.5, BigInteger.ONE.shiftLeft(64).add(BigInteger.ONE)};
+        for (Object version : versions) {
+            // A non-JSON body proves the body is never decoded: decoding it would throw out of poll().
+            ServiceBusReceivedMessage message = withVersion("this is not json", version, true);
+            ServiceBusReceiverClient receiver = receiverWith(message);
+
+            int[] handled = {0};
+            List<Object> envelopes = new ArrayList<>();
+            List<Throwable> errors = new ArrayList<>();
+            AsbConsumer.builder(receiver)
+                .handler(URN, (env, msg) -> handled[0]++)
+                .onError((e, env, msg) -> {
+                    errors.add(e);
+                    envelopes.add(env);
+                })
+                .build().poll();
+
+            assertEquals(0, handled[0], "version=" + version);
+            assertEquals(1, errors.size(), "version=" + version);
+            assertInstanceOf(BabelQueueException.class, errors.get(0));
+            assertNull(envelopes.get(0), "version=" + version);
+
+            ArgumentCaptor<DeadLetterOptions> options = ArgumentCaptor.forClass(DeadLetterOptions.class);
+            verify(receiver, times(1)).deadLetter(eq(message), options.capture());
+            assertEquals("unsupported schema version", options.getValue().getDeadLetterReason());
+            verify(receiver, never()).abandon(any(ServiceBusReceivedMessage.class));
+            verify(receiver, never()).complete(any(ServiceBusReceivedMessage.class));
+        }
+    }
+
+    @Test
+    void schemaVersionGateDeadLettersEvenWhenErrorHandlerThrows() {
+        ServiceBusReceivedMessage message = withVersion("this is not json", "2", true);
+        ServiceBusReceiverClient receiver = receiverWith(message);
+        AsbConsumer consumer = AsbConsumer.builder(receiver)
+            .onError((e, env, msg) -> env.traceId())
+            .build();
+
+        assertThrows(NullPointerException.class, consumer::poll);
+
+        // The message is settled before the (throwing) callback runs, so it cannot loop to MaxDeliveryCount.
+        verify(receiver, times(1)).deadLetter(eq(message), any(DeadLetterOptions.class));
+        verify(receiver, never()).abandon(any(ServiceBusReceivedMessage.class));
+    }
+
+    @Test
+    void schemaVersionGateTruncatesLongRejectedValueInDescriptionAndReport() {
+        String value = "9".repeat(5000);
+        ServiceBusReceivedMessage message = withVersion("this is not json", value, true);
+        ServiceBusReceiverClient receiver = receiverWith(message);
+        List<Throwable> errors = new ArrayList<>();
+        AsbConsumer.builder(receiver).onError((e, env, msg) -> errors.add(e)).build().poll();
+
+        ArgumentCaptor<DeadLetterOptions> options = ArgumentCaptor.forClass(DeadLetterOptions.class);
+        verify(receiver, times(1)).deadLetter(eq(message), options.capture());
+        String description = options.getValue().getDeadLetterErrorDescription();
+        assertTrue(description.length() < 4096, "description length=" + description.length());
+        assertTrue(description.contains("'" + "9".repeat(64) + "...'"), description);
+        assertTrue(!description.contains("9".repeat(65)), description);
+        assertEquals(1, errors.size());
+        assertEquals(description, errors.get(0).getMessage());
+    }
+
+    @Test
+    void schemaVersionGateKeepsShortRejectedValueIntact() {
+        String value = "7".repeat(64);
+        ServiceBusReceivedMessage message = withVersion("this is not json", value, true);
+        ServiceBusReceiverClient receiver = receiverWith(message);
+        AsbConsumer.builder(receiver).build().poll();
+
+        ArgumentCaptor<DeadLetterOptions> options = ArgumentCaptor.forClass(DeadLetterOptions.class);
+        verify(receiver).deadLetter(eq(message), options.capture());
+        assertTrue(options.getValue().getDeadLetterErrorDescription().contains("'" + value + "'"));
+        assertTrue(!options.getValue().getDeadLetterErrorDescription().contains("..."));
     }
 }

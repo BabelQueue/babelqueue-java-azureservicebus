@@ -67,6 +67,13 @@ dead-letter sub-queue. The poll loop never stops on a bad message — observe vi
 `onError`/`onUnknownUrn`. The envelope is unchanged (`schema_version` stays `1`); Azure
 Service Bus is purely additive.
 
+**Schema-version gate (§4.7).** Before decoding the body the consumer reads
+`ApplicationProperties["bq-schema-version"]`. Missing, null or blank (empty / ASCII whitespace
+only) → normal decode. Integer `1` (any integral width) and the string `"1"` → normal decode. Any
+other value (`2`, `1.5`, `"2"`, `"x"`, `" 1"`, other types) → the body is **not** decoded, the handler
+is not called, `onError` is notified with a `null` envelope, and the message is explicitly
+**dead-lettered** (reason `unsupported schema version`) — never abandoned.
+
 ## Build & test
 
 ```bash

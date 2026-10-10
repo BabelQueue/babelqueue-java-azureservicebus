@@ -1,8 +1,12 @@
 package com.babelqueue.azureservicebus;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.azure.core.util.BinaryData;
@@ -10,10 +14,13 @@ import com.azure.core.util.IterableStream;
 import com.azure.messaging.servicebus.ServiceBusMessage;
 import com.azure.messaging.servicebus.ServiceBusReceivedMessage;
 import com.azure.messaging.servicebus.ServiceBusReceiverClient;
+import com.azure.messaging.servicebus.models.DeadLetterOptions;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.json.JSONArray;
@@ -86,6 +93,62 @@ class AsbConformanceTest {
                 .poll();
 
             assertEquals(testCase.getInt("expected_attempts"), seen[0], testCase.getString("name"));
+        }
+    }
+
+    @Test
+    void schemaVersionGateMatchesGolden() throws Exception {
+        JSONObject gate = asbBlock().getJSONObject("schema_version_gate");
+        String property = gate.getString("property");
+        String fixture = resource(gate.getString("fixture"));
+        JSONArray cases = gate.getJSONArray("cases");
+        assertTrue(cases.length() > 0);
+
+        for (int i = 0; i < cases.length(); i++) {
+            JSONObject testCase = cases.getJSONObject(i);
+            boolean decode = "decode".equals(testCase.getString("expect"));
+            // A JSON number stands for a native AMQP integer: exercise integral values at int32 and int64
+            // width (a non-integral number is a double).
+            List<Object> variants = new ArrayList<>();
+            if (testCase.has("value") && testCase.get("value") instanceof Number number) {
+                if (number.doubleValue() == Math.rint(number.doubleValue())) {
+                    variants.add(number.intValue());
+                    variants.add(number.longValue());
+                } else {
+                    variants.add(number.doubleValue());
+                }
+            } else if (testCase.has("value")) {
+                variants.add(testCase.getString("value"));
+            } else {
+                variants.add(null);
+            }
+
+            for (Object variant : variants) {
+                String label = (testCase.has("value") ? "value=" + testCase.get("value") : "absent")
+                    + " (" + (variant == null ? "none" : variant.getClass().getSimpleName()) + ")";
+                ServiceBusReceivedMessage msg = mock(ServiceBusReceivedMessage.class);
+                when(msg.getBody()).thenReturn(BinaryData.fromString(fixture));
+                when(msg.getDeliveryCount()).thenReturn(1L);
+                Map<String, Object> props = new HashMap<>();
+                if (variant != null) {
+                    props.put(property, variant);
+                }
+                when(msg.getApplicationProperties()).thenReturn(props);
+
+                ServiceBusReceiverClient receiver = mock(ServiceBusReceiverClient.class);
+                when(receiver.receiveMessages(anyInt())).thenReturn(new IterableStream<>(List.of(msg)));
+
+                int[] handled = {0};
+                AsbConsumer.builder(receiver)
+                    .handler(URN, (env, message) -> handled[0]++)
+                    .build()
+                    .poll();
+
+                assertEquals(decode ? 1 : 0, handled[0], label);
+                verify(receiver, times(decode ? 1 : 0)).complete(any(ServiceBusReceivedMessage.class));
+                verify(receiver, times(decode ? 0 : 1))
+                    .deadLetter(any(ServiceBusReceivedMessage.class), any(DeadLetterOptions.class));
+            }
         }
     }
 }

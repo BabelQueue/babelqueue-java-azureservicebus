@@ -7,6 +7,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [Unreleased]
+
+### Fixed
+
+- `AsbConsumer` now applies the §4.7 schema-version gate **before** decoding the body: when the
+  `bq-schema-version` application property is present and is not the supported version, the body is
+  never decoded and the handler is never called; `onError` is notified (with a `null` envelope) and the
+  message is explicitly **dead-lettered** (reason `unsupported schema version`) — never abandoned, which
+  would redeliver it until `MaxDeliveryCount`. Integer `1` of any integral width and the string `"1"` are
+  accepted; other numbers (`2`, `0`, `1.5`), strings (`"2"`, `"x"`, `" 1"`) and types are rejected. A
+  missing, null or blank (empty / ASCII-whitespace-only) property keeps the existing decode path.
+- `onError` may now receive a `null` envelope for a schema-version gate rejection (the body is not decoded, so
+  there is no envelope). The message is dead-lettered **before** `onError` is invoked, so a callback that
+  dereferences the envelope cannot leave it unsettled.
+- The rejected `bq-schema-version` value echoed in the dead-letter description and the `onError` message is
+  capped at its first 64 characters (`...` appended when cut), since Service Bus limits the description to 4096
+  characters.
+
 ## [1.0.0] - 2026-06-13
 
 ### Added
