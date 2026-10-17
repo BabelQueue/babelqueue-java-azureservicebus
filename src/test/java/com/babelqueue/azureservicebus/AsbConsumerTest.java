@@ -20,6 +20,8 @@ import com.azure.messaging.servicebus.ServiceBusReceivedMessage;
 import com.azure.messaging.servicebus.ServiceBusReceiverClient;
 import com.azure.messaging.servicebus.models.DeadLetterOptions;
 import com.babelqueue.BabelQueueException;
+import com.babelqueue.DeadLetters;
+import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import com.babelqueue.UnknownUrnException;
 import java.math.BigInteger;
@@ -70,6 +72,48 @@ class AsbConsumerTest {
         assertEquals(1, count);
         assertEquals(2, seen[0]);
         verify(receiver).complete(any(ServiceBusReceivedMessage.class));
+    }
+
+    /** Body carrying a top-level {@code extra_top} and {@code meta.vendor_flag} (ADR-0031). */
+    private static String jsonWithExtras() {
+        return "{\"job\":\"" + URN + "\",\"trace_id\":\"trace-1\",\"data\":{\"order_id\":7},"
+            + "\"meta\":{\"id\":\"m-1\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,"
+            + "\"created_at\":1700000000000,\"vendor_flag\":true},\"attempts\":0,\"extra_top\":1}";
+    }
+
+    @Test
+    void deliveryCountReconcilePreservesUnknownTopLevelAndMetaKeys() {
+        ServiceBusReceiverClient receiver = receiverWith(received(3, jsonWithExtras())); // attempts 0 -> 2
+        Envelope[] seen = { null };
+        AsbConsumer.builder(receiver).handler(URN, (env, msg) -> seen[0] = env).build().poll();
+
+        assertEquals(2, seen[0].attempts());
+        assertEquals(1L, seen[0].extras().get("extra_top"));
+        assertEquals(true, seen[0].meta().extras().get("vendor_flag"));
+    }
+
+    /**
+     * ASB dead-letters natively (the broker keeps the original body), so the adapter's DLQ-adjacent path is the
+     * envelope handed to {@code onError} on a failing handler: a user republishing or annotating it must still
+     * see the extras and a {@code dead_letter} block built from it must carry them.
+     */
+    @Test
+    void failingHandlerEnvelopeKeepsUnknownKeysThroughDeadLetterAnnotation() {
+        ServiceBusReceiverClient receiver = receiverWith(received(3, jsonWithExtras()));
+        Envelope[] failed = { null };
+        AsbConsumer.builder(receiver)
+            .handler(URN, (env, msg) -> { throw new IllegalStateException("boom"); })
+            .onError((e, env, msg) -> failed[0] = env)
+            .build()
+            .poll();
+
+        Envelope dead = EnvelopeCodec.decode(EnvelopeCodec.encode(
+            DeadLetters.annotate(failed[0], "failed", "orders", failed[0].attempts(), "boom",
+                IllegalStateException.class.getName())));
+        assertEquals(1L, dead.extras().get("extra_top"));
+        assertEquals(true, dead.meta().extras().get("vendor_flag"));
+        assertEquals("failed", dead.deadLetter().reason());
+        assertEquals("orders", dead.deadLetter().originalQueue());
     }
 
     @Test

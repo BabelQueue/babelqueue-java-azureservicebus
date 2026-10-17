@@ -215,9 +215,7 @@ public final class AsbConsumer {
         if (nativeAttempts <= envelope.attempts()) {
             return envelope;
         }
-        return new Envelope(
-            envelope.job(), envelope.traceId(), envelope.data(), envelope.meta(),
-            nativeAttempts, envelope.deadLetter());
+        return envelope.withAttempts(nativeAttempts);
     }
 
     private void report(Throwable error, Envelope envelope, ServiceBusReceivedMessage message) {
