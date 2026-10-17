@@ -93,12 +93,15 @@ class AsbConsumerTest {
     }
 
     /**
-     * ASB dead-letters natively (the broker keeps the original body), so the adapter's DLQ-adjacent path is the
-     * envelope handed to {@code onError} on a failing handler: a user republishing or annotating it must still
-     * see the extras and a {@code dead_letter} block built from it must carry them.
+     * Core-level lock, not an adapter DLQ test: ASB dead-letters natively and the broker keeps the original
+     * body, so this adapter has no path that rewrites the body into a DLQ (its only dead-letter call is the
+     * schema-version quarantine, covered by the native {@code deadLetter} tests). What the adapter does own is the envelope it hands to
+     * {@code onError}: that must still carry the unknown keys (first two assertions), and the core
+     * {@link DeadLetters#annotate} an application builds on it must keep them (remaining assertions, which
+     * exercise the core, not this adapter).
      */
     @Test
-    void failingHandlerEnvelopeKeepsUnknownKeysThroughDeadLetterAnnotation() {
+    void onErrorEnvelopeKeepsUnknownKeysAndCoreDeadLetterAnnotationRetainsThem() {
         ServiceBusReceiverClient receiver = receiverWith(received(3, jsonWithExtras()));
         Envelope[] failed = { null };
         AsbConsumer.builder(receiver)
@@ -106,6 +109,9 @@ class AsbConsumerTest {
             .onError((e, env, msg) -> failed[0] = env)
             .build()
             .poll();
+
+        assertEquals(1L, failed[0].extras().get("extra_top"), "adapter: onError envelope keeps top-level extras");
+        assertEquals(true, failed[0].meta().extras().get("vendor_flag"), "adapter: onError envelope keeps meta extras");
 
         Envelope dead = EnvelopeCodec.decode(EnvelopeCodec.encode(
             DeadLetters.annotate(failed[0], "failed", "orders", failed[0].attempts(), "boom",
