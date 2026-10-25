@@ -9,6 +9,33 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+MINOR (ADR-0037): the consumer gains an opt-in BabelQueue DLQ and settles poison bodies and version-gated
+deliveries on their first delivery. The envelope is unchanged (`schema_version` stays `1`).
+
+### Added
+
+- `AsbConsumer.Builder.deadLetterSender(ServiceBusSenderClient)` (opt-in): a sender bound to the `<queue>.dlq`
+  entity (an ordinary Service Bus queue, §4.5; it must exist and belongs to the caller). "Dead-lettering on"
+  means this sender is set.
+
+### Changed (behaviour)
+
+- **Poison body** (not JSON, not an envelope, no valid identity, or an unsupported `meta.schema_version`):
+  never handed to a handler and never retried by the SDK. With a DLQ sender it is sent as the ADR-0035 record
+  (`PoisonRecord`, `reason: "poison"`, `original_queue` = the receiver's entity, the exact body bytes kept) and
+  `Complete`d **only after** the send succeeded; a failed send `Abandon`s it and is reported. With no DLQ
+  sender nothing changes: it is abandoned and reported, so `MaxDeliveryCount` moves it to the native
+  sub-queue.
+- **Version-gated delivery** (`bq-schema-version` present, not null, not blank, not `1`): settled on the first
+  delivery, never decoded, no handler or hook, no retry. With a DLQ sender the **raw body, byte for byte** (no
+  `dead_letter` block) is sent to `<queue>.dlq` and the message `Complete`d after the send (a failed send
+  `Abandon`s it, so the write is retried on redelivery). With no DLQ sender nothing changes: it is dead-lettered
+  into the native `$DeadLetterQueue` (reason `unsupported schema version`). This consumer has no unknown-URN
+  strategy option, so the rule is `fail`; an `onUnknownUrn` hook never affects it.
+- Requires `babelqueue-core` 1.13.0 (was 1.11.0) for `PoisonRecord`.
+- Vendored the cross-SDK conformance suite v1.8.0 (`version_gate_asb`, `poison_dlq` runners added) and moved
+  the CI pin to it.
+
 ## [1.0.2] - 2026-10-17
 
 ### Fixed
