@@ -9,13 +9,11 @@ import com.azure.messaging.servicebus.models.DeadLetterOptions;
 import com.babelqueue.BabelQueueException;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
-import com.babelqueue.JsonValues;
 import com.babelqueue.PoisonRecord;
 import com.babelqueue.UnknownUrnException;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
@@ -226,15 +224,7 @@ public final class AsbConsumer {
      * {@code poison_dlq} drives it for every body).
      */
     static String poisonRecord(byte[] body, String originalQueue, int attempts, Throwable cause) {
-        Map<String, Object> block = new LinkedHashMap<>();
-        block.put("reason", "poison");
-        block.put("error", cause.getMessage());
-        block.put("exception", cause.getClass().getName());
-        block.put("failed_at", System.currentTimeMillis());
-        block.put("original_queue", originalQueue);
-        block.put("attempts", attempts);
-        block.put("lang", EnvelopeCodec.SOURCE_LANG);
-        return PoisonRecord.build(body, JsonValues.encode(block));
+        return PoisonRecord.build(body, originalQueue, attempts, cause.getMessage(), cause.getClass().getName());
     }
 
     /** The bytes as text, or {@code null} when they are not valid UTF-8 (never U+FFFD substitution). */
