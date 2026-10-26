@@ -16,8 +16,10 @@ import static org.mockito.Mockito.when;
 
 import com.azure.core.util.BinaryData;
 import com.azure.core.util.IterableStream;
+import com.azure.messaging.servicebus.ServiceBusMessage;
 import com.azure.messaging.servicebus.ServiceBusReceivedMessage;
 import com.azure.messaging.servicebus.ServiceBusReceiverClient;
+import com.azure.messaging.servicebus.ServiceBusSenderClient;
 import com.azure.messaging.servicebus.models.DeadLetterOptions;
 import com.babelqueue.BabelQueueException;
 import com.babelqueue.DeadLetters;
@@ -306,5 +308,194 @@ class AsbConsumerTest {
         verify(receiver).deadLetter(eq(message), options.capture());
         assertTrue(options.getValue().getDeadLetterErrorDescription().contains("'" + value + "'"));
         assertTrue(!options.getValue().getDeadLetterErrorDescription().contains("..."));
+    }
+    // ---- ADR-0037: poison record, version gate and the DLQ sender --------------------------------
+
+    private static ServiceBusReceiverClient receiverFor(String entity, ServiceBusReceivedMessage... messages) {
+        ServiceBusReceiverClient receiver = receiverWith(messages);
+        when(receiver.getEntityPath()).thenReturn(entity);
+        return receiver;
+    }
+
+    private static ServiceBusMessage sentTo(ServiceBusSenderClient sender) {
+        ArgumentCaptor<ServiceBusMessage> sent = ArgumentCaptor.forClass(ServiceBusMessage.class);
+        verify(sender, times(1)).sendMessage(sent.capture());
+        return sent.getValue();
+    }
+
+    @Test
+    void poisonBodyWithDlqSenderIsWrittenAsTheAdr0035RecordThenCompleted() {
+        ServiceBusReceivedMessage message = received(4, "{\"not\":\"an envelope\",\"big\":12345678901234567890}");
+        when(message.getMessageId()).thenReturn("m-1");
+        ServiceBusReceiverClient receiver = receiverFor("orders", message);
+        ServiceBusSenderClient sender = mock(ServiceBusSenderClient.class);
+        int[] handled = {0};
+
+        AsbConsumer.builder(receiver).handler(URN, (env, msg) -> handled[0]++).deadLetterSender(sender).build().poll();
+
+        assertEquals(0, handled[0]);
+        ServiceBusMessage record = sentTo(sender);
+        assertEquals("m-1", record.getMessageId());
+        assertEquals("application/json", record.getContentType());
+        String text = record.getBody().toString();
+        // An object body is spliced: its members stay as written (no re-encoding), plus the dead_letter block.
+        assertTrue(text.contains("\"big\":12345678901234567890"), text);
+        org.json.JSONObject block = new org.json.JSONObject(text).getJSONObject("dead_letter");
+        assertEquals("poison", block.getString("reason"));
+        assertEquals("orders", block.getString("original_queue"));
+        assertEquals(3, block.getInt("attempts"));
+        verify(receiver).complete(message);
+        verify(receiver, never()).abandon(any(ServiceBusReceivedMessage.class));
+    }
+
+    @Test
+    void poisonBytesThatAreNotUtf8AreBase64WrappedExactly() {
+        ServiceBusReceivedMessage message = mock(ServiceBusReceivedMessage.class);
+        when(message.getBody()).thenReturn(BinaryData.fromBytes(new byte[] {(byte) 0xFF, (byte) 0xFE, 'a'}));
+        when(message.getDeliveryCount()).thenReturn(1L);
+        ServiceBusReceiverClient receiver = receiverFor("orders/subscriptions/audit", message);
+        ServiceBusSenderClient sender = mock(ServiceBusSenderClient.class);
+
+        AsbConsumer.builder(receiver).deadLetterSender(sender).build().poll();
+
+        org.json.JSONObject record = new org.json.JSONObject(sentTo(sender).getBody().toString());
+        assertEquals("//5h", record.getString("raw"));
+        assertEquals("base64", record.getString("raw_encoding"));
+        // The entity of a topic subscription is the topic.
+        assertEquals("orders", record.getJSONObject("dead_letter").getString("original_queue"));
+        verify(receiver).complete(message);
+    }
+
+    @Test
+    void validEnvelopeWithOneInvalidUtf8ByteIsPoisonNotHandedToAHandler() {
+        // Decoded leniently (U+FFFD) this would be a valid envelope; it must be dead-lettered byte for byte instead.
+        String json = EnvelopeCodec.encode(EnvelopeCodec.make(URN, Map.of("note", "ab"), "orders", null));
+        byte[] text = json.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        int at = json.indexOf("ab");
+        byte[] bad = text.clone();
+        bad[at] = (byte) 0xFF; // one invalid byte inside a string value of an otherwise valid envelope
+        ServiceBusReceivedMessage message = mock(ServiceBusReceivedMessage.class);
+        when(message.getBody()).thenReturn(BinaryData.fromBytes(bad));
+        when(message.getDeliveryCount()).thenReturn(1L);
+        ServiceBusReceiverClient receiver = receiverFor("orders", message);
+        ServiceBusSenderClient sender = mock(ServiceBusSenderClient.class);
+        int[] handled = {0};
+
+        AsbConsumer.builder(receiver).handler(URN, (env, msg) -> handled[0]++).deadLetterSender(sender).build().poll();
+
+        assertEquals(0, handled[0]);
+        org.json.JSONObject record = new org.json.JSONObject(sentTo(sender).getBody().toString());
+        assertEquals("base64", record.getString("raw_encoding"));
+        assertEquals(java.util.Base64.getEncoder().encodeToString(bad), record.getString("raw"));
+        assertEquals("poison", record.getJSONObject("dead_letter").getString("reason"));
+        verify(receiver).complete(message);
+    }
+
+    @Test
+    void invalidUtf8BodyWithoutDlqSenderIsAbandoned() {
+        ServiceBusReceivedMessage message = mock(ServiceBusReceivedMessage.class);
+        when(message.getBody()).thenReturn(BinaryData.fromBytes(new byte[] {'{', (byte) 0xFF, '}'}));
+        when(message.getDeliveryCount()).thenReturn(1L);
+        ServiceBusReceiverClient receiver = receiverFor("orders", message);
+        int[] handled = {0};
+
+        AsbConsumer.builder(receiver).handler(URN, (env, msg) -> handled[0]++).build().poll();
+
+        assertEquals(0, handled[0]);
+        verify(receiver).abandon(message);
+    }
+
+    @Test
+    void poisonFailedDlqSendAbandonsAndReports() {
+        ServiceBusReceivedMessage message = received(1, "{}");
+        ServiceBusReceiverClient receiver = receiverFor("orders", message);
+        ServiceBusSenderClient sender = mock(ServiceBusSenderClient.class);
+        org.mockito.Mockito.doThrow(new IllegalStateException("dlq down")).when(sender)
+            .sendMessage(any(ServiceBusMessage.class));
+        List<Throwable> errors = new ArrayList<>();
+
+        AsbConsumer.builder(receiver).deadLetterSender(sender).onError((e, env, m) -> errors.add(e)).build().poll();
+
+        verify(receiver).abandon(message);
+        verify(receiver, never()).complete(any(ServiceBusReceivedMessage.class));
+        assertEquals(2, errors.size());
+        assertEquals("dlq down", errors.get(1).getMessage());
+    }
+
+    @Test
+    void poisonWithoutDlqSenderIsAbandonedLeftToTheNativeMechanism() {
+        ServiceBusReceivedMessage message = received(1, "{}");
+        ServiceBusReceiverClient receiver = receiverFor("orders", message);
+
+        AsbConsumer.builder(receiver).build().poll();
+
+        verify(receiver).abandon(message);
+        verify(receiver, never()).complete(any(ServiceBusReceivedMessage.class));
+        verify(receiver, never()).deadLetter(any(ServiceBusReceivedMessage.class), any(DeadLetterOptions.class));
+    }
+
+    @Test
+    void versionGatedWithDlqSenderForwardsTheRawBytesThenCompletes() {
+        // Deliberately non-canonical: a writer that decodes and re-encodes would change these bytes.
+        String raw = "{\"meta\": {\"schema_version\": 2}, \"job\": \"" + URN + "\", \"data\": {\"n\": 1.50}}\n";
+        ServiceBusReceivedMessage message = withVersion(raw, 2, true);
+        when(message.getContentType()).thenReturn("application/json");
+        when(message.getMessageId()).thenReturn("m-9");
+        ServiceBusReceiverClient receiver = receiverFor("orders", message);
+        ServiceBusSenderClient sender = mock(ServiceBusSenderClient.class);
+        int[] handled = {0};
+        int[] unknown = {0};
+        List<Throwable> errors = new ArrayList<>();
+
+        AsbConsumer.builder(receiver)
+            .handler(URN, (env, msg) -> handled[0]++)
+            .onUnknownUrn((env, msg) -> unknown[0]++)
+            .onError((e, env, m) -> errors.add(e))
+            .deadLetterSender(sender)
+            .build().poll();
+
+        assertEquals(0, handled[0]);
+        assertEquals(0, unknown[0]);
+        ServiceBusMessage forwarded = sentTo(sender);
+        assertEquals(raw, forwarded.getBody().toString());
+        assertEquals("m-9", forwarded.getMessageId());
+        assertEquals("application/json", forwarded.getContentType());
+        verify(receiver).complete(message);
+        verify(receiver, never()).deadLetter(any(ServiceBusReceivedMessage.class), any(DeadLetterOptions.class));
+        verify(receiver, never()).abandon(any(ServiceBusReceivedMessage.class));
+        assertEquals(1, errors.size());
+    }
+
+    @Test
+    void versionGatedFailedDlqSendAbandonsAndReports() {
+        ServiceBusReceivedMessage message = withVersion("not json", "2", true);
+        ServiceBusReceiverClient receiver = receiverFor("orders", message);
+        ServiceBusSenderClient sender = mock(ServiceBusSenderClient.class);
+        org.mockito.Mockito.doThrow(new IllegalStateException("dlq down")).when(sender)
+            .sendMessage(any(ServiceBusMessage.class));
+        List<Throwable> errors = new ArrayList<>();
+
+        AsbConsumer.builder(receiver).deadLetterSender(sender).onError((e, env, m) -> errors.add(e)).build().poll();
+
+        verify(receiver).abandon(message);
+        verify(receiver, never()).complete(any(ServiceBusReceivedMessage.class));
+        verify(receiver, never()).deadLetter(any(ServiceBusReceivedMessage.class), any(DeadLetterOptions.class));
+        assertEquals(2, errors.size());
+        assertTrue(errors.get(0).getMessage().contains("bq-schema-version"));
+        assertEquals("dlq down", errors.get(1).getMessage());
+    }
+
+    @Test
+    void versionGatedHookOnlyConsumerNeverRunsTheHookAndDeadLettersNatively() {
+        // A hook never affects a version-gated delivery (ADR-0037, "Configured strategy only"): it must not Complete.
+        ServiceBusReceivedMessage message = withVersion(envelopeJson(), 2, true);
+        ServiceBusReceiverClient receiver = receiverFor("orders", message);
+        int[] unknown = {0};
+
+        AsbConsumer.builder(receiver).onUnknownUrn((env, msg) -> unknown[0]++).build().poll();
+
+        assertEquals(0, unknown[0]);
+        verify(receiver).deadLetter(eq(message), any(DeadLetterOptions.class));
+        verify(receiver, never()).complete(any(ServiceBusReceivedMessage.class));
     }
 }

@@ -1,15 +1,21 @@
 package com.babelqueue.azureservicebus;
 
+import com.azure.core.util.BinaryData;
+import com.azure.messaging.servicebus.ServiceBusMessage;
 import com.azure.messaging.servicebus.ServiceBusReceivedMessage;
 import com.azure.messaging.servicebus.ServiceBusReceiverClient;
+import com.azure.messaging.servicebus.ServiceBusSenderClient;
 import com.azure.messaging.servicebus.models.DeadLetterOptions;
 import com.babelqueue.BabelQueueException;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
+import com.babelqueue.JsonValues;
+import com.babelqueue.PoisonRecord;
 import com.babelqueue.UnknownUrnException;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
@@ -22,17 +28,29 @@ import java.util.function.BooleanSupplier;
  * {@code DeliveryCount - 1} (broker-authoritative on ASB) for the handler. The poll loop never
  * stops on a bad message — observe via {@code onError}/{@code onUnknownUrn}.
  *
- * <p>Per §4.7 the {@code bq-schema-version} application property is checked <b>before</b> the body is
- * decoded: when it is present and is not the schema version the core supports
- * ({@link EnvelopeCodec#SCHEMA_VERSION}), the body is never decoded or routed. Producers write an
+ * <p><b>Version gate (§4.7, ADR-0037 decision 1).</b> The {@code bq-schema-version} application property is checked
+ * <b>before</b> the body is decoded: when it is present and is not the schema version the core supports
+ * ({@link EnvelopeCodec#SCHEMA_VERSION}), the body is never decoded or routed, no handler or
+ * {@code onUnknownUrn} hook runs and nothing is retried, on the first delivery. Producers write an
  * integer {@code 1}, so any integral numeric type with value {@code 1} and the string {@code "1"}
  * (compared exactly as sent, no trimming) are accepted; every other number ({@code 2}, {@code 0},
- * {@code 1.5}), string ({@code "2"}, {@code "x"}, {@code "01"}, {@code " 1"}) or type is rejected.
- * A rejected message is explicitly <b>dead-lettered</b> (reason {@code unsupported schema version}) —
- * never abandoned, which would redeliver it until {@code MaxDeliveryCount} — and {@code onError} is
- * notified (with a {@code null} envelope). A missing, {@code null}, or blank string (empty or
- * ASCII-whitespace-only: space, tab, LF, VT, FF, CR) property changes nothing, and a supported
- * version still goes through the post-decode {@link EnvelopeCodec#accepts} check.
+ * {@code 1.5}), string ({@code "2"}, {@code "x"}, {@code "01"}, {@code " 1"}) or type is rejected. A missing,
+ * {@code null}, or blank string (empty or ASCII-whitespace-only: space, tab, LF, VT, FF, CR) property changes
+ * nothing, and a supported version still goes through the post-decode {@link EnvelopeCodec#accepts} check. This
+ * consumer has no unknown-URN strategy option, so the configured strategy is {@code fail}; {@code onError} is
+ * notified (with a {@code null} envelope). With a {@link Builder#deadLetterSender dead-letter sender} the body is
+ * sent to {@code <queue>.dlq} <b>exactly as received</b> (no {@code dead_letter} block) and the message
+ * {@code Complete}d only after the send succeeded (a failed send {@code Abandon}s it, so the gate rejects the
+ * redelivery again and the write is retried). With none it is handed to the broker's native mechanism: explicitly
+ * <b>dead-lettered</b> (reason {@code unsupported schema version}) into {@code $DeadLetterQueue} — never abandoned,
+ * which would redeliver it until {@code MaxDeliveryCount}.
+ *
+ * <p><b>Poison (ADR-0037 decision 2).</b> A body that is not a valid envelope (not JSON, no valid identity, an
+ * unsupported {@code meta.schema_version}) is never handed to a handler and never retried by the SDK. With a
+ * dead-letter sender the ADR-0035 record ({@link PoisonRecord}, {@code reason: "poison"}, {@code original_queue} =
+ * the receiver's entity) is sent to it and the message {@code Complete}d only after the send succeeded (a failed
+ * send {@code Abandon}s it). With none it is {@code Abandon}ed and reported — left to {@code MaxDeliveryCount}, which
+ * moves it to the native sub-queue.
  */
 public final class AsbConsumer {
 
@@ -62,6 +80,7 @@ public final class AsbConsumer {
     private final Duration maxWaitTime;
     private final ErrorHandler onError;
     private final UnknownUrnHandler onUnknownUrn;
+    private final ServiceBusSenderClient deadLetterSender;
 
     private AsbConsumer(Builder builder) {
         this.receiver = builder.receiver;
@@ -70,6 +89,7 @@ public final class AsbConsumer {
         this.maxWaitTime = builder.maxWaitTime;
         this.onError = builder.onError;
         this.onUnknownUrn = builder.onUnknownUrn;
+        this.deadLetterSender = builder.deadLetterSender;
     }
 
     public static Builder builder(ServiceBusReceiverClient receiver) {
@@ -106,21 +126,49 @@ public final class AsbConsumer {
             Object declared = message.getApplicationProperties().get(SCHEMA_VERSION_PROPERTY);
             String description = "Rejected a BabelQueue message with unsupported " + SCHEMA_VERSION_PROPERTY
                 + " property '" + truncateForReport(declared) + "' (supported: " + EnvelopeCodec.SCHEMA_VERSION + "); body not decoded.";
-            // Settle first: the message is terminal, so a throwing onError must not leave it unsettled.
-            receiver.deadLetter(message, new DeadLetterOptions()
-                .setDeadLetterReason(SCHEMA_VERSION_DEAD_LETTER_REASON)
-                .setDeadLetterErrorDescription(description));
+            if (deadLetterSender == null) {
+                // Native (rule 3): an explicit DeadLetter into $DeadLetterQueue, not an Abandon that would
+                // redeliver it until MaxDeliveryCount. Settle first: the message is terminal, so a throwing
+                // onError must not leave it unsettled.
+                receiver.deadLetter(message, new DeadLetterOptions()
+                    .setDeadLetterReason(SCHEMA_VERSION_DEAD_LETTER_REASON)
+                    .setDeadLetterErrorDescription(description));
+                report(new BabelQueueException(description), null, message);
+                return;
+            }
+            // Rule 4: the raw body, byte for byte, to <queue>.dlq; Complete only after the send. Rule 5: a failed
+            // send Abandons it (the gate rejects the redelivery again, so the write is retried).
+            try {
+                send(rawMessage(message));
+            } catch (RuntimeException sendFailure) {
+                receiver.abandon(message);
+                report(new BabelQueueException(description), null, message);
+                report(sendFailure, null, message);
+                return;
+            }
+            receiver.complete(message);
             report(new BabelQueueException(description), null, message);
             return;
         }
 
-        String body = message.getBody() == null ? "" : message.getBody().toString();
+        // Strict UTF-8: BinaryData.toString() would turn a bad byte into U+FFFD and let a corrupted body decode as a
+        // valid envelope. A body that is not valid UTF-8 is poison (ADR-0037 decision 2), never decoded.
+        String body = strictUtf8(bodyBytes(message));
+        if (body == null) {
+            BabelQueueException cause = new BabelQueueException(
+                "Rejected a BabelQueue message whose body is not valid UTF-8 from Azure Service Bus.");
+            Envelope none = EnvelopeCodec.decode("");
+            report(cause, none, message);
+            settlePoison(message, none, cause);
+            return;
+        }
         Envelope envelope = reconcile(EnvelopeCodec.decode(body), message.getDeliveryCount());
 
         if (!EnvelopeCodec.accepts(envelope)) {
-            report(new BabelQueueException("Rejected a non-conformant BabelQueue envelope from Azure Service Bus."),
-                envelope, message);
-            receiver.abandon(message);
+            BabelQueueException cause = new BabelQueueException(
+                "Rejected a non-conformant BabelQueue envelope from Azure Service Bus.");
+            report(cause, envelope, message);
+            settlePoison(message, envelope, cause);
             return;
         }
 
@@ -145,6 +193,91 @@ public final class AsbConsumer {
             report(error, envelope, message);
             receiver.abandon(message);
         }
+    }
+
+    /**
+     * Settles a poison body (ADR-0037 decision 2): the ADR-0035 record to the DLQ sender and {@code Complete} after the
+     * send; a failed send {@code Abandon}s it. With no sender it is {@code Abandon}ed (native: {@code MaxDeliveryCount}).
+     */
+    private void settlePoison(ServiceBusReceivedMessage message, Envelope envelope, Throwable cause) {
+        if (deadLetterSender == null) {
+            receiver.abandon(message);
+            return;
+        }
+        try {
+            String record = poisonRecord(bodyBytes(message), entityName(), (int) Math.max(message.getDeliveryCount() - 1, 0),
+                cause);
+            ServiceBusMessage forwarded = new ServiceBusMessage(BinaryData.fromString(record))
+                .setContentType("application/json");
+            if (message.getMessageId() != null) {
+                forwarded.setMessageId(message.getMessageId());
+            }
+            send(forwarded);
+        } catch (RuntimeException sendFailure) {
+            receiver.abandon(message);
+            report(sendFailure, envelope, message);
+            return;
+        }
+        receiver.complete(message);
+    }
+
+    /**
+     * The ADR-0035 DLQ record of a poison {@code body}: the one builder this consumer writes with (conformance
+     * {@code poison_dlq} drives it for every body).
+     */
+    static String poisonRecord(byte[] body, String originalQueue, int attempts, Throwable cause) {
+        Map<String, Object> block = new LinkedHashMap<>();
+        block.put("reason", "poison");
+        block.put("error", cause.getMessage());
+        block.put("exception", cause.getClass().getName());
+        block.put("failed_at", System.currentTimeMillis());
+        block.put("original_queue", originalQueue);
+        block.put("attempts", attempts);
+        block.put("lang", EnvelopeCodec.SOURCE_LANG);
+        return PoisonRecord.build(body, JsonValues.encode(block));
+    }
+
+    /** The bytes as text, or {@code null} when they are not valid UTF-8 (never U+FFFD substitution). */
+    private static String strictUtf8(byte[] body) {
+        try {
+            return java.nio.charset.StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                .decode(java.nio.ByteBuffer.wrap(body)).toString();
+        } catch (java.nio.charset.CharacterCodingException invalid) {
+            return null;
+        }
+    }
+
+    /** The exact bytes of the message body (empty when it has none). */
+    private static byte[] bodyBytes(ServiceBusReceivedMessage message) {
+        return message.getBody() == null ? new byte[0] : message.getBody().toBytes();
+    }
+
+    /** The receiver's entity: a queue name, or the topic of a topic subscription. */
+    private String entityName() {
+        String path = receiver.getEntityPath();
+        if (path == null) {
+            return "";
+        }
+        int subscription = path.indexOf("/subscriptions/");
+        return subscription >= 0 ? path.substring(0, subscription) : path;
+    }
+
+    /** A copy of {@code message} for the DLQ: the exact body bytes, content type and message id; nothing re-encoded. */
+    private static ServiceBusMessage rawMessage(ServiceBusReceivedMessage message) {
+        ServiceBusMessage forwarded = new ServiceBusMessage(BinaryData.fromBytes(bodyBytes(message)));
+        if (message.getContentType() != null) {
+            forwarded.setContentType(message.getContentType());
+        }
+        if (message.getMessageId() != null) {
+            forwarded.setMessageId(message.getMessageId());
+        }
+        return forwarded;
+    }
+
+    private void send(ServiceBusMessage message) {
+        deadLetterSender.sendMessage(message);
     }
 
     /**
@@ -232,6 +365,7 @@ public final class AsbConsumer {
         private Duration maxWaitTime;
         private ErrorHandler onError;
         private UnknownUrnHandler onUnknownUrn;
+        private ServiceBusSenderClient deadLetterSender;
 
         private Builder(ServiceBusReceiverClient receiver) {
             this.receiver = Objects.requireNonNull(receiver, "receiver");
@@ -267,6 +401,18 @@ public final class AsbConsumer {
 
         public Builder onUnknownUrn(UnknownUrnHandler handler) {
             this.onUnknownUrn = handler;
+            return this;
+        }
+
+        /**
+         * Turns BabelQueue dead-lettering on (opt-in, ADR-0037 decision 2): a sender bound to the {@code <queue>.dlq}
+         * entity (an ordinary Service Bus queue, §4.5; it must exist). A poison body is sent to it as the ADR-0035
+         * record and a version-gated delivery as its raw body; the source message is {@code Complete}d only after the
+         * send succeeded. Unset (the default): a poison body is abandoned and a version-gated delivery is
+         * dead-lettered into the native {@code $DeadLetterQueue}. The sender belongs to the caller and is not closed.
+         */
+        public Builder deadLetterSender(ServiceBusSenderClient sender) {
+            this.deadLetterSender = sender;
             return this;
         }
 

@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -14,6 +15,7 @@ import com.azure.core.util.IterableStream;
 import com.azure.messaging.servicebus.ServiceBusMessage;
 import com.azure.messaging.servicebus.ServiceBusReceivedMessage;
 import com.azure.messaging.servicebus.ServiceBusReceiverClient;
+import com.azure.messaging.servicebus.ServiceBusSenderClient;
 import com.azure.messaging.servicebus.models.DeadLetterOptions;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
@@ -26,11 +28,13 @@ import java.util.Map;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 /**
  * Azure Service Bus binding conformance against the vendored canonical suite's {@code asb}
  * block: the §4 native projection and the {@code attempts = max(body, DeliveryCount - 1)}
- * reconciliation. The final Service Bus types are mocked with Mockito — no Azure, no network.
+ * reconciliation, plus the ADR-0037 {@code version_gate_asb} settle rule and the ADR-0035 {@code poison_dlq} record
+ * shape driven through this consumer. The final Service Bus types are mocked with Mockito — no Azure, no network.
  */
 class AsbConformanceTest {
 
@@ -164,6 +168,118 @@ class AsbConformanceTest {
                 verify(receiver, times(decode ? 0 : 1))
                     .deadLetter(any(ServiceBusReceivedMessage.class), any(DeadLetterOptions.class));
             }
+        }
+    }
+    // ---- poison_dlq (ADR-0035 shape, ADR-0037 decision 2) -----------------------------------------
+
+    @Test
+    void poisonDlqRecordShapeMatchesGolden() throws Exception {
+        JSONArray cases = new JSONObject(resource("manifest.json")).getJSONObject("poison_dlq").getJSONArray("cases");
+        assertTrue(cases.length() > 0);
+        for (int i = 0; i < cases.length(); i++) {
+            JSONObject testCase = cases.getJSONObject(i);
+            String name = testCase.getString("name");
+            ServiceBusReceivedMessage msg = mock(ServiceBusReceivedMessage.class);
+            // Service Bus carries raw bytes, so every case (invalid UTF-8 included) goes through the consumer.
+            when(msg.getBody()).thenReturn(BinaryData.fromBytes(PoisonRecordChecks.bodyOf(testCase)));
+            when(msg.getDeliveryCount()).thenReturn(1L);
+            ServiceBusReceiverClient receiver = mock(ServiceBusReceiverClient.class);
+            when(receiver.receiveMessages(anyInt())).thenReturn(new IterableStream<>(List.of(msg)));
+            when(receiver.getEntityPath()).thenReturn("orders");
+            ServiceBusSenderClient sender = mock(ServiceBusSenderClient.class);
+            int[] handled = {0};
+
+            AsbConsumer.builder(receiver)
+                .handler(URN, (env, message) -> handled[0]++)
+                .deadLetterSender(sender)
+                .build()
+                .poll();
+
+            assertEquals(0, handled[0], name);
+            ArgumentCaptor<ServiceBusMessage> sent = ArgumentCaptor.forClass(ServiceBusMessage.class);
+            verify(sender, times(1)).sendMessage(sent.capture());
+            verify(receiver, times(1)).complete(msg);
+            PoisonRecordChecks.check(testCase, sent.getValue().getBody().toString());
+        }
+    }
+
+    // ---- version_gate_asb (ADR-0037 decision 1) ---------------------------------------------------
+
+    @Test
+    void versionGateSettleRuleMatchesGolden() throws Exception {
+        JSONObject section = new JSONObject(resource("manifest.json")).getJSONObject("version_gate_asb");
+        JSONArray cases = section.getJSONArray("cases");
+        JSONArray bodies = section.getJSONArray("incoming_bodies");
+        assertEquals(17, cases.length());
+        int asserted = 0;
+        for (int i = 0; i < cases.length(); i++) {
+            JSONObject testCase = cases.getJSONObject(i);
+            if (!"fail".equals(testCase.optString("on_unknown_urn", "fail"))) {
+                // The Java Azure Service Bus consumer has only an onUnknownUrn callback and no strategy option (it
+                // behaves as `fail`): the suite tells Java, .NET and Node runners to skip these rows, never to pass
+                // them.
+                continue;
+            }
+            asserted++;
+            for (int b = 0; b < bodies.length(); b++) {
+                runVersionGateCase(testCase, bodies.getJSONObject(b).getString("body"));
+            }
+        }
+        assertTrue(asserted > 0);
+    }
+
+    private static void runVersionGateCase(JSONObject testCase, String body) {
+        String label = testCase.getString("name");
+        boolean deadLetter = "on".equals(testCase.getString("dead_letter"));
+        JSONObject expect = testCase.getJSONObject("expect");
+
+        ServiceBusReceivedMessage msg = mock(ServiceBusReceivedMessage.class);
+        when(msg.getBody()).thenReturn(BinaryData.fromString(body));
+        when(msg.getDeliveryCount()).thenReturn(testCase.has("bq_attempts") ? 8L : 1L);
+        Map<String, Object> props = new HashMap<>();
+        props.put("bq-schema-version", 2);
+        if (testCase.has("bq_attempts")) {
+            props.put("bq-attempts", testCase.getString("bq_attempts"));
+        }
+        when(msg.getApplicationProperties()).thenReturn(props);
+        ServiceBusReceiverClient receiver = mock(ServiceBusReceiverClient.class);
+        when(receiver.receiveMessages(anyInt())).thenReturn(new IterableStream<>(List.of(msg)));
+        ServiceBusSenderClient sender = mock(ServiceBusSenderClient.class);
+        if ("fails".equals(testCase.optString("dlq_write", "ok"))) {
+            org.mockito.Mockito.doThrow(new IllegalStateException("dlq write failed")).when(sender)
+                .sendMessage(any(ServiceBusMessage.class));
+        }
+        int[] handled = {0};
+        AsbConsumer.Builder builder = AsbConsumer.builder(receiver).handler(URN, (env, message) -> handled[0]++);
+        if (deadLetter) {
+            builder.deadLetterSender(sender);
+        }
+        builder.build().poll();
+
+        assertEquals(0, handled[0], label);
+        // "off" means no DLQ writer exists in this consumer (no sender): outcome_no_writer applies.
+        String outcome = !deadLetter && expect.has("outcome_no_writer")
+            ? expect.getString("outcome_no_writer") : expect.getString("outcome");
+        switch (outcome) {
+            case "dlq_raw" -> {
+                ArgumentCaptor<ServiceBusMessage> sent = ArgumentCaptor.forClass(ServiceBusMessage.class);
+                verify(sender, times(1)).sendMessage(sent.capture());
+                assertEquals(body, sent.getValue().getBody().toString(), label);
+                assertTrue(!sent.getValue().getBody().toString().contains("\"dead_letter\""), label);
+                verify(receiver, times(1)).complete(msg);
+                verify(receiver, never()).abandon(any(ServiceBusReceivedMessage.class));
+            }
+            case "unsettled" -> {
+                verify(receiver, times(1)).abandon(msg);
+                verify(receiver, never()).complete(any(ServiceBusReceivedMessage.class));
+            }
+            case "native" -> {
+                // An explicit native DeadLetter (this consumer's choice) or an Abandon: never Complete, never SDK retry.
+                verify(sender, never()).sendMessage(any(ServiceBusMessage.class));
+                verify(receiver, never()).complete(any(ServiceBusReceivedMessage.class));
+                verify(receiver, times(1)).deadLetter(any(ServiceBusReceivedMessage.class), any(DeadLetterOptions.class));
+            }
+            default -> throw new AssertionError("unknown outcome in " + label + ": " + outcome);
         }
     }
 }
