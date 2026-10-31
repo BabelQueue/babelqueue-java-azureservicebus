@@ -498,4 +498,32 @@ class AsbConsumerTest {
         verify(receiver).deadLetter(eq(message), any(DeadLetterOptions.class));
         verify(receiver, never()).complete(any(ServiceBusReceivedMessage.class));
     }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void publishedTraceparentReachesTheHandlerViaHeadersOfAndNotTheBody() {
+        String traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        com.azure.messaging.servicebus.ServiceBusSenderClient sender =
+            mock(com.azure.messaging.servicebus.ServiceBusSenderClient.class);
+        when(sender.getEntityPath()).thenReturn("orders");
+        org.mockito.ArgumentCaptor<com.azure.messaging.servicebus.ServiceBusMessage> captor =
+            org.mockito.ArgumentCaptor.forClass(com.azure.messaging.servicebus.ServiceBusMessage.class);
+        AsbPublisher.create(sender).publish(URN, Map.of("order_id", 1), "trace-1", null,
+            Map.of("traceparent", traceparent));
+        verify(sender).sendMessage(captor.capture());
+        com.azure.messaging.servicebus.ServiceBusMessage sent = captor.getValue();
+
+        // the broker hands the same application properties and body back
+        ServiceBusReceivedMessage delivered = received(1, sent.getBody().toString());
+        when(delivered.getApplicationProperties()).thenReturn(sent.getApplicationProperties());
+        Map<String, String>[] seen = new Map[]{null};
+
+        AsbConsumer.builder(receiverWith(delivered))
+            .handler(URN, (e, m) -> seen[0] = BabelHandler.headersOf(m))
+            .build()
+            .poll();
+
+        assertEquals(traceparent, seen[0].get("traceparent"));
+        org.junit.jupiter.api.Assertions.assertFalse(sent.getBody().toString().contains("traceparent"));
+    }
 }
