@@ -652,4 +652,19 @@ class AsbConsumerTest {
             verify(nativeReceiver, never()).abandon(any(ServiceBusReceivedMessage.class));
         }
     }
+
+    @Test
+    void eventQueueIsAlwaysTheReceiverEntityWhateverTheBodyMetaQueueSays() {
+        // ASB reports the receiver's entity: a poison or version-gated body is never trusted for a queue name, so no
+        // blank rule applies. A Unicode-space meta.queue must not leak into the event.
+        for (String queue : new String[] {"\\u2003", "\\u00a0", " \\t", "billing"}) {
+            ServiceBusReceivedMessage message = received(1, "{\"meta\":{\"queue\":\"" + queue + "\"}}");
+            List<DeadLetterEvent> events = new ArrayList<>();
+
+            AsbConsumer.builder(receiverFor("orders", message)).deadLetterSender(senderTo("orders.dlq"))
+                .deadLetterObserver(events::add).build().poll();
+
+            assertEquals(List.of(new DeadLetterEvent("orders", "orders.dlq", "poison")), events, queue);
+        }
+    }
 }
