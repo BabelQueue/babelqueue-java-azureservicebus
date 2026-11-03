@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-03
+
 ### Added
 
 - **Dead-letter observer (ADR-0039 section 5.1).** `AsbConsumer.Builder#deadLetterObserver(DeadLetterObserver)` takes the core's optional `com.babelqueue.DeadLetterObserver` (needs a `babelqueue-core` that ships it). It is called once per dead-letter this consumer carried out, after it is confirmed: a record sent to the BabelQueue DLQ sender (poison body with `reason` `poison`, raw version-gated body with an empty `reason`), and the SDK-initiated native `deadLetter` call made for a version-gated delivery when no DLQ sender is set (`deadLetterQueue` and `reason` empty, as the SDK writes no `dead_letter` block; no extra attribute). `DeadLetterEvent.queue` is the receiver's entity. It is not called when the send or the native call fails, for a broker-initiated dead-letter (`MaxDeliveryCount`), or when the message is only abandoned; an observer failure is logged and never changes the settle outcome. Without an observer nothing changes.
