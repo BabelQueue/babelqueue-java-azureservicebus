@@ -41,4 +41,21 @@ class AsbMessagesTest {
         assertTrue(EnvelopeCodec.accepts(decoded));
         assertEquals("urn:babel:orders:created", EnvelopeCodec.urn(decoded));
     }
+
+    @Test
+    void toMapSurfacesStringPropertiesAndSkipsNumbersBlanksAndNull() {
+        com.azure.messaging.servicebus.ServiceBusReceivedMessage received =
+            org.mockito.Mockito.mock(com.azure.messaging.servicebus.ServiceBusReceivedMessage.class);
+        Map<String, Object> props = new java.util.LinkedHashMap<>();
+        props.put("traceparent", "00-x");
+        props.put("blank", "");
+        props.put("bq-schema-version", 1);
+        org.mockito.Mockito.when(received.getApplicationProperties()).thenReturn(props);
+
+        assertEquals(Map.of("traceparent", "00-x"), AsbMessages.toMap(received));
+        assertTrue(AsbMessages.toMap(null).isEmpty());
+        assertTrue(BabelHandler.headersOf(null).isEmpty());
+        assertTrue(AsbMessages.toMap(org.mockito.Mockito.mock(
+            com.azure.messaging.servicebus.ServiceBusReceivedMessage.class)).isEmpty());
+    }
 }

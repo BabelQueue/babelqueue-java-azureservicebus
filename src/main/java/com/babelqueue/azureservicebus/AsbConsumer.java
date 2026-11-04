@@ -7,6 +7,8 @@ import com.azure.messaging.servicebus.ServiceBusReceiverClient;
 import com.azure.messaging.servicebus.ServiceBusSenderClient;
 import com.azure.messaging.servicebus.models.DeadLetterOptions;
 import com.babelqueue.BabelQueueException;
+import com.babelqueue.DeadLetterEvent;
+import com.babelqueue.DeadLetterObserver;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import com.babelqueue.PoisonRecord;
@@ -79,6 +81,7 @@ public final class AsbConsumer {
     private final ErrorHandler onError;
     private final UnknownUrnHandler onUnknownUrn;
     private final ServiceBusSenderClient deadLetterSender;
+    private final DeadLetterObserver deadLetterObserver;
 
     private AsbConsumer(Builder builder) {
         this.receiver = builder.receiver;
@@ -88,6 +91,7 @@ public final class AsbConsumer {
         this.onError = builder.onError;
         this.onUnknownUrn = builder.onUnknownUrn;
         this.deadLetterSender = builder.deadLetterSender;
+        this.deadLetterObserver = builder.deadLetterObserver;
     }
 
     public static Builder builder(ServiceBusReceiverClient receiver) {
@@ -131,6 +135,8 @@ public final class AsbConsumer {
                 receiver.deadLetter(message, new DeadLetterOptions()
                     .setDeadLetterReason(SCHEMA_VERSION_DEAD_LETTER_REASON)
                     .setDeadLetterErrorDescription(description));
+                // The SDK itself dead-lettered it natively (ADR-0039 section 5.1 (2)): counted, with no BabelQueue DLQ.
+                notifyDeadLetter("", "");
                 report(new BabelQueueException(description), null, message);
                 return;
             }
@@ -144,6 +150,7 @@ public final class AsbConsumer {
                 report(sendFailure, null, message);
                 return;
             }
+            notifyDeadLetter(deadLetterSender.getEntityPath(), "");
             receiver.complete(message);
             report(new BabelQueueException(description), null, message);
             return;
@@ -216,6 +223,7 @@ public final class AsbConsumer {
             report(sendFailure, envelope, message);
             return;
         }
+        notifyDeadLetter(deadLetterSender.getEntityPath(), "poison");
         receiver.complete(message);
     }
 
@@ -264,6 +272,19 @@ public final class AsbConsumer {
             forwarded.setMessageId(message.getMessageId());
         }
         return forwarded;
+    }
+
+    /**
+     * Reports a dead-letter the SDK just carried out (ADR-0039 section 5.1): a confirmed send to the BabelQueue DLQ, or
+     * a native {@code deadLetter} call that returned. {@code queue} is the receiver's entity (a version-gated message is
+     * never decoded, so there is no {@code meta.queue}); {@code deadLetterQueue} is empty for the native dead-letter.
+     * An observer failure never escapes.
+     */
+    private void notifyDeadLetter(String deadLetterQueue, String reason) {
+        if (deadLetterObserver == null) {
+            return;
+        }
+        DeadLetterObserver.notifySafely(deadLetterObserver, new DeadLetterEvent(entityName(), deadLetterQueue, reason));
     }
 
     private void send(ServiceBusMessage message) {
@@ -356,6 +377,7 @@ public final class AsbConsumer {
         private ErrorHandler onError;
         private UnknownUrnHandler onUnknownUrn;
         private ServiceBusSenderClient deadLetterSender;
+        private DeadLetterObserver deadLetterObserver;
 
         private Builder(ServiceBusReceiverClient receiver) {
             this.receiver = Objects.requireNonNull(receiver, "receiver");
@@ -403,6 +425,19 @@ public final class AsbConsumer {
          */
         public Builder deadLetterSender(ServiceBusSenderClient sender) {
             this.deadLetterSender = sender;
+            return this;
+        }
+
+        /**
+         * Optional observer called once per dead-letter this consumer carried out (ADR-0039 section 5.1), after it is
+         * confirmed: a record sent to the BabelQueue DLQ (poison body, raw version-gated body), or the native
+         * {@code deadLetter} call made for a version-gated delivery when no {@link #deadLetterSender sender} is set
+         * ({@code deadLetterQueue} and {@code reason} are then empty: the SDK writes no {@code dead_letter} block). Not called when
+         * the send or the native call fails, or for a broker-initiated dead-letter ({@code MaxDeliveryCount}). A failure
+         * of the observer is logged and never changes the settle outcome.
+         */
+        public Builder deadLetterObserver(DeadLetterObserver deadLetterObserver) {
+            this.deadLetterObserver = deadLetterObserver;
             return this;
         }
 

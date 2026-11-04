@@ -22,6 +22,8 @@ import com.azure.messaging.servicebus.ServiceBusReceiverClient;
 import com.azure.messaging.servicebus.ServiceBusSenderClient;
 import com.azure.messaging.servicebus.models.DeadLetterOptions;
 import com.babelqueue.BabelQueueException;
+import com.babelqueue.DeadLetterEvent;
+import com.babelqueue.DeadLetterObserver;
 import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
@@ -497,5 +499,172 @@ class AsbConsumerTest {
         assertEquals(0, unknown[0]);
         verify(receiver).deadLetter(eq(message), any(DeadLetterOptions.class));
         verify(receiver, never()).complete(any(ServiceBusReceivedMessage.class));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void publishedTraceparentReachesTheHandlerViaHeadersOfAndNotTheBody() {
+        String traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        com.azure.messaging.servicebus.ServiceBusSenderClient sender =
+            mock(com.azure.messaging.servicebus.ServiceBusSenderClient.class);
+        when(sender.getEntityPath()).thenReturn("orders");
+        org.mockito.ArgumentCaptor<com.azure.messaging.servicebus.ServiceBusMessage> captor =
+            org.mockito.ArgumentCaptor.forClass(com.azure.messaging.servicebus.ServiceBusMessage.class);
+        AsbPublisher.create(sender).publish(URN, Map.of("order_id", 1), "trace-1", null,
+            Map.of("traceparent", traceparent));
+        verify(sender).sendMessage(captor.capture());
+        com.azure.messaging.servicebus.ServiceBusMessage sent = captor.getValue();
+
+        // the broker hands the same application properties and body back
+        ServiceBusReceivedMessage delivered = received(1, sent.getBody().toString());
+        when(delivered.getApplicationProperties()).thenReturn(sent.getApplicationProperties());
+        Map<String, String>[] seen = new Map[]{null};
+
+        AsbConsumer.builder(receiverWith(delivered))
+            .handler(URN, (e, m) -> seen[0] = BabelHandler.headersOf(m))
+            .build()
+            .poll();
+
+        assertEquals(traceparent, seen[0].get("traceparent"));
+        org.junit.jupiter.api.Assertions.assertFalse(sent.getBody().toString().contains("traceparent"));
+    }
+
+    // ---- ADR-0039 section 5.1 dead-letter observer ----------------------------------------------
+
+    private static ServiceBusSenderClient senderTo(String entity) {
+        ServiceBusSenderClient sender = mock(ServiceBusSenderClient.class);
+        when(sender.getEntityPath()).thenReturn(entity);
+        return sender;
+    }
+
+    @Test
+    void observerSeesAPoisonRecordSentToTheBabelQueueDlq() {
+        ServiceBusReceivedMessage message = received(1, "{}");
+        ServiceBusReceiverClient receiver = receiverFor("orders", message);
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        AsbConsumer.builder(receiver).deadLetterSender(senderTo("orders.dlq"))
+            .deadLetterObserver(events::add).build().poll();
+
+        assertEquals(List.of(new DeadLetterEvent("orders", "orders.dlq", "poison")), events);
+        verify(receiver).complete(message);
+    }
+
+    @Test
+    void observerSeesAVersionGatedRawBodySentToTheBabelQueueDlqWithAnEmptyReason() {
+        ServiceBusReceivedMessage message = withVersion("not json", 2, true);
+        ServiceBusReceiverClient receiver = receiverFor("orders", message);
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        AsbConsumer.builder(receiver).deadLetterSender(senderTo("orders.dlq"))
+            .deadLetterObserver(events::add).build().poll();
+
+        assertEquals(List.of(new DeadLetterEvent("orders", "orders.dlq", "")), events);
+        verify(receiver).complete(message);
+    }
+
+    @Test
+    void observerSeesTheSdkInitiatedNativeDeadLetterExactlyOnceWithAnEmptyDeadLetterQueue() {
+        ServiceBusReceivedMessage message = withVersion("not json", 2, true);
+        ServiceBusReceiverClient receiver = receiverFor("orders", message);
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        AsbConsumer.builder(receiver).deadLetterObserver(events::add).build().poll();
+
+        assertEquals(List.of(new DeadLetterEvent("orders", "", "")), events);
+        assertEquals("", events.get(0).deadLetterQueue());
+        verify(receiver, times(1)).deadLetter(eq(message), any(DeadLetterOptions.class));
+    }
+
+    @Test
+    void observerIsNotCalledWhenTheNativeDeadLetterCallFails() {
+        ServiceBusReceivedMessage message = withVersion("not json", 2, true);
+        ServiceBusReceiverClient receiver = receiverFor("orders", message);
+        org.mockito.Mockito.doThrow(new IllegalStateException("lock lost")).when(receiver)
+            .deadLetter(any(ServiceBusReceivedMessage.class), any(DeadLetterOptions.class));
+        List<DeadLetterEvent> events = new ArrayList<>();
+        AsbConsumer consumer = AsbConsumer.builder(receiver).deadLetterObserver(events::add).build();
+
+        assertThrows(IllegalStateException.class, consumer::poll);
+
+        assertTrue(events.isEmpty());
+    }
+
+    @Test
+    void observerIsNotCalledWhenTheDlqSendFails() {
+        List<DeadLetterEvent> events = new ArrayList<>();
+        for (ServiceBusReceivedMessage message : List.of(received(1, "{}"), withVersion("not json", 2, true))) {
+            ServiceBusReceiverClient receiver = receiverFor("orders", message);
+            ServiceBusSenderClient sender = senderTo("orders.dlq");
+            org.mockito.Mockito.doThrow(new IllegalStateException("dlq down")).when(sender)
+                .sendMessage(any(ServiceBusMessage.class));
+
+            AsbConsumer.builder(receiver).deadLetterSender(sender).deadLetterObserver(events::add).build().poll();
+
+            verify(receiver).abandon(message);
+        }
+
+        assertTrue(events.isEmpty());
+    }
+
+    @Test
+    void observerIsNotCalledForANonDeadLetterSettle() {
+        List<DeadLetterEvent> events = new ArrayList<>();
+        ServiceBusReceiverClient abandoned = receiverFor("orders", received(1, "{}"));
+
+        // poison without a DLQ sender is abandoned (left to MaxDeliveryCount), and a handled message is completed
+        AsbConsumer.builder(abandoned).deadLetterObserver(events::add).build().poll();
+        AsbConsumer.builder(receiverFor("orders", received(1, envelopeJson())))
+            .handler(URN, (env, msg) -> { })
+            .deadLetterSender(senderTo("orders.dlq"))
+            .deadLetterObserver(events::add).build().poll();
+        AsbConsumer.builder(receiverFor("orders", received(1, envelopeJson())))
+            .handler(URN, (env, msg) -> { throw new IllegalStateException("boom"); })
+            .deadLetterSender(senderTo("orders.dlq"))
+            .deadLetterObserver(events::add).build().poll();
+
+        assertTrue(events.isEmpty());
+    }
+
+    @Test
+    void aThrowingObserverDoesNotChangeTheSettleOutcome() {
+        DeadLetterObserver boom = event -> { throw new IllegalStateException("observer down"); };
+        DeadLetterObserver fatal = event -> { throw new AssertionError("observer asserts"); };
+
+        for (DeadLetterObserver observer : List.of(boom, fatal)) {
+            ServiceBusReceivedMessage poison = received(1, "{}");
+            ServiceBusReceiverClient poisonReceiver = receiverFor("orders", poison);
+            AsbConsumer.builder(poisonReceiver).deadLetterSender(senderTo("orders.dlq"))
+                .deadLetterObserver(observer).build().poll();
+            verify(poisonReceiver).complete(poison);
+            verify(poisonReceiver, never()).abandon(any(ServiceBusReceivedMessage.class));
+
+            ServiceBusReceivedMessage gated = withVersion("not json", 2, true);
+            ServiceBusReceiverClient gatedReceiver = receiverFor("orders", gated);
+            AsbConsumer.builder(gatedReceiver).deadLetterSender(senderTo("orders.dlq"))
+                .deadLetterObserver(observer).build().poll();
+            verify(gatedReceiver).complete(gated);
+
+            ServiceBusReceivedMessage nativeGated = withVersion("not json", 2, true);
+            ServiceBusReceiverClient nativeReceiver = receiverFor("orders", nativeGated);
+            AsbConsumer.builder(nativeReceiver).deadLetterObserver(observer).build().poll();
+            verify(nativeReceiver, times(1)).deadLetter(eq(nativeGated), any(DeadLetterOptions.class));
+            verify(nativeReceiver, never()).abandon(any(ServiceBusReceivedMessage.class));
+        }
+    }
+
+    @Test
+    void eventQueueIsAlwaysTheReceiverEntityWhateverTheBodyMetaQueueSays() {
+        // ASB reports the receiver's entity: a poison or version-gated body is never trusted for a queue name, so no
+        // blank rule applies. A Unicode-space meta.queue must not leak into the event.
+        for (String queue : new String[] {"\\u2003", "\\u00a0", " \\t", "billing"}) {
+            ServiceBusReceivedMessage message = received(1, "{\"meta\":{\"queue\":\"" + queue + "\"}}");
+            List<DeadLetterEvent> events = new ArrayList<>();
+
+            AsbConsumer.builder(receiverFor("orders", message)).deadLetterSender(senderTo("orders.dlq"))
+                .deadLetterObserver(events::add).build().poll();
+
+            assertEquals(List.of(new DeadLetterEvent("orders", "orders.dlq", "poison")), events, queue);
+        }
     }
 }
